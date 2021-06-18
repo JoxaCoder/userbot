@@ -606,3 +606,277 @@ def request_interact(call):
             {request_action: {'players': player_object},
              '$inc': {'players_count': increment_value}}
         )
+
+        updated_document = database.requests.find_one_and_update(
+            {'_id': required_request['_id']},
+            update_dict,
+            return_document=ReturnDocument.AFTER
+        )
+
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(
+            InlineKeyboardButton(
+                text='Вступить в игру или выйти из игры',
+                callback_data='request interact'
+            )
+        )
+
+        bot.edit_message_text(
+            lang.new_request.format(
+                owner=updated_document['owner']['name'],
+                time=datetime.utcfromtimestamp(updated_document['time']).strftime('%H:%M'),
+                order='Игроков нет.' if not updated_document['players_count'] else
+                      'Игроки:\n' + '\n'.join([f'{i + 1}. {p["name"]}' for i, p in enumerate(updated_document['players'])])
+            ),
+            chat_id=call.message.chat.id,
+            message_id=message_id,
+            reply_markup=keyboard
+        )
+
+        bot.answer_callback_query(callback_query_id=call.id, show_alert=False, text=alert_message)
+    else:
+        bot.edit_message_text('Заявка больше не существует.', chat_id=call.message.chat.id, message_id=message_id)
+
+
+@bot.group_message_handler(regexp=command_regexp('create'))
+def create(message, *args, **kwargs):
+    existing_request = database.requests.find_one({'chat': message.chat.id})
+    if existing_request:
+        bot.send_message(message.chat.id, 'В этом чате уже есть игра!', reply_to_message_id=existing_request['message_id'])
+        return
+    existing_game = database.games.find_one({'chat': message.chat.id, 'game': 'mafia'})
+    if existing_game:
+        bot.send_message(message.chat.id, 'В этом чате уже идёт игра!')
+        return
+
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(
+        InlineKeyboardButton(
+            text='Вступить в игру или выйти из игры',
+            callback_data='request interact'
+        )
+    )
+
+    player_object = user_object(message.from_user)
+    player_object['alive'] = True
+    request_overdue_time = time() + config.REQUEST_OVERDUE_TIME
+
+    answer = lang.new_request.format(
+        owner=get_name(message.from_user),
+        time=datetime.utcfromtimestamp(request_overdue_time).strftime('%H:%M'),
+        order=f'Игроки:\n1. {player_object["name"]}'
+    )
+    sent_message = bot.send_message(message.chat.id, answer, reply_markup=keyboard)
+
+    database.requests.insert_one({
+        'id': str(uuid4())[:8],
+        'owner': player_object,
+        'players': [player_object],
+        'time': request_overdue_time,
+        'chat': message.chat.id,
+        'message_id': sent_message.message_id,
+        'players_count': 1
+    })
+
+
+@bot.group_message_handler(regexp=command_regexp('start'))
+def start_game(message, *args, **kwargs):
+    req = database.requests.find_and_modify(
+        {
+            'owner.id': message.from_user.id,
+            'chat': message.chat.id,
+            'players_count': {'$gte': config.PLAYERS_COUNT_TO_START}
+        },
+        new=False,
+        remove=True
+    )
+    if req is not None:
+        players_count = req['players_count']
+
+        cards = ['mafia'] * (players_count // 3 - 1) + ['don', 'sheriff']
+        cards += ['peace'] * (players_count - len(cards))
+        random.shuffle(cards)
+
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(
+            InlineKeyboardButton(
+                text='🃏 Вытянуть карту',
+                callback_data='take card'
+            )
+        )
+
+        stage_number = min(stages.keys())
+
+        message_id = bot.send_message(
+            message.chat.id,
+            lang.take_card.format(
+                order='\n'.join([f'{i + 1}. {p["name"]}' for i, p in enumerate(req['players'])]),
+                not_took=', '.join(map(str, range(1, len(req['players']) + 1))),
+            ),
+            reply_markup=keyboard
+        ).message_id
+
+        database.games.insert_one({
+            'game': 'mafia',
+            'chat': req['chat'],
+            'id': req['id'],
+            'stage': stage_number,
+            'day_count': 0,
+            'players': req['players'],
+            'cards': cards,
+            'next_stage_time': time() + stages[stage_number]['time'],
+            'message_id': message_id,
+            'don': [],
+            'vote': {},
+            'shots': [],
+            'played': []
+        })
+
+    else:
+        bot.send_message(message.chat.id, 'У тебя нет заявки на игру, которую возможно начать.')
+
+
+@bot.group_message_handler(regexp=command_regexp('cancel'))
+def cancel(message, *args, **kwargs):
+    req = database.requests.find_one_and_delete({
+        'owner.id': message.from_user.id,
+        'chat': message.chat.id
+    })
+    if req:
+        answer = 'Твоя заявка удалена.'
+    else:
+        answer = 'У тебя нет заявки на игру.'
+    bot.send_message(message.chat.id, answer)
+
+
+def create_poll(message, game, poll_type, suggestion):
+    if not game or game['stage'] not in (0, -4):
+        return
+
+    check_roles = game['stage'] == 0
+
+    existing_poll = database.polls.find_one({
+        'chat': message.chat.id,
+        'type': poll_type
+    })
+    if existing_poll:
+        bot.send_message(
+            message.chat.id,
+            'В этом чате уже идёт голосование!',
+            reply_to_message_id=existing_poll['message_id']
+        )
+        return
+
+    poll = {
+        'chat': message.chat.id,
+        'type': poll_type,
+        'creator': get_name(message.from_user),
+        'check_roles': check_roles,
+        'votes': [message.from_user.id],
+    }
+
+    keyboard = InlineKeyboardMarkup()
+    if check_roles:
+        peace_team = set()
+        mafia_team = set()
+
+        for player in game['players']:
+            if player['alive']:
+                if player['role'] in ('don', 'mafia'):
+                    mafia_team.add(player['id'])
+                else:
+                    peace_team.add(player['id'])
+
+        peace_votes = 0
+        mafia_votes = 0
+        if message.from_user.id in peace_team:
+            peace_votes += 1
+        else:
+            mafia_votes += 1
+
+        poll['peace_count'] = peace_votes
+        poll['peace_required'] = 2 * len(peace_team) // 3
+        poll['mafia_count'] = mafia_votes
+        poll['mafia_required'] = 2 * len(mafia_team) // 3
+
+    else:
+        poll['count'] = 1
+        poll['required'] = 2 * len(game['players']) // 3
+
+    keyboard.add(
+        InlineKeyboardButton(
+            text='Проголосовать',
+            callback_data='poll'
+        )
+    )
+
+    answer = f'{poll["creator"]} предлагает {suggestion}.'
+    poll['message_id'] = bot.send_message(message.chat.id, answer, reply_markup=keyboard).message_id
+    database.polls.insert_one(poll)
+
+
+@bot.group_message_handler(regexp=command_regexp('end'))
+def force_game_end(message, game, *args, **kwargs):
+    create_poll(message, game, 'end', 'закончить игру')
+
+
+@bot.group_message_handler(regexp=command_regexp('skip'))
+def skip_current_stage(message, game, *args, **kwargs):
+    create_poll(message, game, 'skip', 'пропустить текущую стадию')
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'poll')
+def poll_vote(call):
+    message_id = call.message.message_id
+    poll = database.polls.find_one({'message_id': message_id})
+
+    if not poll:
+        bot.edit_message_text(
+            'Голосование больше не существует.',
+            chat_id=call.message.chat.id,
+            message_id=message_id
+        )
+        return
+
+    if call.from_user.id in poll['votes']:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Твой голос уже был учтён.',
+        )
+        return
+
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        'players': {'$elemMatch': {
+            'alive': True,
+            'id': call.from_user.id
+        }},
+        'chat': call.message.chat.id
+    })
+
+    if not player_game:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь голосовать.',
+        )
+        return
+
+    increment_value = {}
+
+    if poll['check_roles']:
+        mafia_count = poll['mafia_count']
+        peace_count = poll['peace_count']
+
+        for player in player_game['players']:
+            if player['id'] == call.from_user.id:
+                if player['role'] in ('don', 'mafia'):
+                    increment_value['mafia_count'] = 1
+                    mafia_count += 1
+                else:
+                    increment_value['peace_count'] = 1
+                    peace_count += 1
+
+                poll_condition = mafia_count > poll['mafia_required'] and peace_count >= poll['peace_required']
+                break
