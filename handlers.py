@@ -131,3 +131,269 @@ def update_rating(rating, name, score, maxlen):
 
 def get_rating_list(rating):
     return '\n'.join(f'{i + 1}. {n}: {s}' for i, (n, s) in enumerate(rating))
+@bot.message_handler(regexp=command_regexp('rating'))
+def rating_command(message, *args, **kwargs):
+    chat_stats = database.stats.find({'chat': message.chat.id})
+
+    if not chat_stats:
+        bot.send_message(message.chat.id, 'Статистика чата пуста.')
+        return
+
+    mafia_rating = []
+    croco_rating = []
+    for stats in chat_stats:
+        if 'total' in stats:
+            update_rating(mafia_rating, stats['name'], get_mafia_score(stats), 5)
+        if 'croco' in stats:
+            update_rating(croco_rating, stats['name'], get_croco_score(stats), 3)
+
+    paragraphs = []
+    if mafia_rating:
+        paragraphs.append('Рейтинг игроков в мафию:\n' + get_rating_list(mafia_rating))
+    if croco_rating:
+        paragraphs.append('Рейтинг игроков в крокодила:\n' + get_rating_list(croco_rating))
+
+    bot.send_message(message.chat.id, '\n\n'.join(paragraphs))
+
+
+@bot.group_message_handler(regexp=command_regexp('croco'))
+def play_croco(message, game, *args, **kwargs):
+    if game:
+        bot.send_message(message.chat.id, 'Игра в этом чате уже идёт.')
+        return
+    word = croco.get_word()[:-2]
+    id = str(uuid4())[:8]
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(
+        InlineKeyboardButton(
+            text='Получить слово',
+            callback_data=f'get_word {id}'
+        )
+    )
+    name = get_name(message.from_user)
+    database.games.insert_one({
+        'game': 'croco',
+        'id': id,
+        'player': message.from_user.id,
+        'name': name,
+        'full_name': get_full_name(message.from_user),
+        'word': word,
+        'chat': message.chat.id,
+        'time': time() + 60,
+        'stage': 0
+    })
+    bot.send_message(
+        message.chat.id,
+        f'Игра началась! {name.capitalize()}, у тебя есть две минуты, чтобы объяснить слово.',
+        reply_markup=keyboard
+    )
+
+
+@bot.group_message_handler(regexp=command_regexp('gallows'))
+def play_gallows(message, game, *args, **kwargs):
+    if game:
+        if game['game'] == 'gallows':
+            bot.send_message(message.chat.id, 'Игра в этом чате уже идёт.', reply_to_message_id=game['message_id'])
+        else:
+            bot.send_message(message.chat.id, 'Игра в этом чате уже идёт.')
+        return
+    word = croco.get_word()[:-2]
+    sent_message = bot.send_message(
+        message.chat.id,
+        lang.gallows.format(
+            result='', word=' '.join(['_'] * len(word)), attempts='', players=''
+        ) % gallows.stickman[0],
+        parse_mode='HTML'
+    )
+    database.games.insert_one({
+        'game': 'gallows',
+        'chat': message.chat.id,
+        'word': word,
+        'wrong': {},
+        'right': {},
+        'names': {},
+        'message_id': sent_message.message_id
+    })
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('get_word'))
+def get_word(call):
+    game = database.games.find_one(
+        {'game': 'croco', 'id': call.data.split()[1], 'player': call.from_user.id}
+    )
+    if game:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=True,
+            text=f'Твоё слово: {game["word"]}.'
+        )
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь получить слово для этой игры.'
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'take card')
+def take_card(call):
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        'stage': -4,
+        'players.id': call.from_user.id,
+        'chat': call.message.chat.id,
+    })
+
+    if player_game:
+        player_index = next(i for i, p in enumerate(player_game['players']) if p['id'] == call.from_user.id)
+        player_object = player_game['players'][player_index]
+
+        if player_object.get('role') is None:
+            keyboard = InlineKeyboardMarkup()
+            keyboard.add(
+                InlineKeyboardButton(
+                    text='🃏 Вытянуть карту',
+                    callback_data='take card'
+                )
+            )
+
+            player_role = player_game['cards'][player_index]
+
+            player_game = database.games.find_one_and_update(
+                {'_id': player_game['_id']},
+                {'$set': {f'players.{player_index}.role': player_role}},
+                return_document=ReturnDocument.AFTER
+            )
+
+            bot.answer_callback_query(
+                callback_query_id=call.id,
+                show_alert=True,
+                text=f'Твоя роль - {role_titles[player_role]}.'
+            )
+
+            players_without_roles = [i + 1 for i, p in enumerate(player_game['players']) if p.get('role') is None]
+
+            if len(players_without_roles) > 0:
+                bot.edit_message_text(
+                    lang.take_card.format(
+                        order=format_roles(player_game),
+                        not_took=', '.join(map(str, players_without_roles))),
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    reply_markup=keyboard
+                )
+
+            else:
+                database.games.update_one(
+                    {'_id': player_game['_id']},
+                    {'$set': {'order': []}}
+                )
+
+                bot.edit_message_text(
+                    'Порядок игроков для игры следующий:\n\n' + format_roles(player_game),
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                )
+
+                go_to_next_stage(player_game, inc=2)
+
+        else:
+            bot.answer_callback_query(
+                callback_query_id=call.id,
+                show_alert=False,
+                text='У тебя уже есть роль.'
+            )
+
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты сейчас не играешь в игру в этой конфе.'
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'mafia team')
+def mafia_team(call):
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        'players': {'$elemMatch': {
+            'id': call.from_user.id,
+            'role': {'$in': ['don', 'mafia']},
+        }},
+        'chat': call.message.chat.id
+    })
+
+    if player_game:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=True,
+            text='Ты играешь в следующей команде:\n' +
+            format_roles(player_game, True, lambda p: p['role'] in ('don', 'mafia')))
+
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь знакомиться с командой мафии.'
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('check don'))
+def check_don(call):
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        'stage': 5,
+        'players': {'$elemMatch': {
+            'alive': True,
+            'role': 'don',
+            'id': call.from_user.id
+        }},
+        'chat': call.message.chat.id
+    })
+
+    if player_game and call.from_user.id not in player_game['played']:
+        check_player = int(re.match(r'check don (\d+)', call.data).group(1)) - 1
+
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=True,
+            text=f'Да, игрок под номером {check_player + 1} - {role_titles["sheriff"]}'
+                 if player_game['players'][check_player]['role'] == 'sheriff' else
+                 f'Нет, игрок под номером {check_player + 1} - не {role_titles["sheriff"]}'
+        )
+
+        database.games.update_one({'_id': player_game['_id']}, {'$addToSet': {'played': call.from_user.id}})
+
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь совершать проверку дона.'
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('check sheriff'))
+def check_sheriff(call):
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        'stage': 6,
+        'players': {'$elemMatch': {
+            'alive': True,
+            'role': 'sheriff',
+            'id': call.from_user.id
+        }},
+        'chat': call.message.chat.id
+    })
+
+    if player_game and call.from_user.id not in player_game['played']:
+        check_player = int(re.match(r'check sheriff (\d+)', call.data).group(1)) - 1
+
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=True,
+            text=f'Да, игрок под номером {check_player + 1} - {role_titles["don"]}'
+                 if player_game['players'][check_player]['role'] == 'don' else
+                 f'Да, игрок под номером {check_player + 1} - {role_titles["mafia"]}'
+                 if player_game['players'][check_player]['role'] == 'mafia' else
+                 f'Нет, игрок под номером {check_player + 1} - не {role_titles["mafia"]}'
+        )
