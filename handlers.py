@@ -880,3 +880,102 @@ def poll_vote(call):
 
                 poll_condition = mafia_count > poll['mafia_required'] and peace_count >= poll['peace_required']
                 break
+    else:
+        increment_value['count'] = 1
+        poll_condition = poll['count'] + 1 > poll['required']
+
+    if poll_condition:
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=message_id
+        )
+        if poll['type'] == 'skip':
+            go_to_next_stage(player_game)
+        elif poll['type'] == 'end':
+            stop_game(player_game, reason='Игроки проголосовали за окончание игры.')
+            return
+
+    database.polls.update_one(
+        {'_id': poll['_id']},
+        {
+            '$addToSet': {'votes': call.from_user.id},
+            '$inc': increment_value
+        }
+    )
+
+    bot.answer_callback_query(
+        callback_query_id=call.id,
+        show_alert=False,
+        text='Голос учтён.'
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('shot'))
+def callback_inline(call):
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        'stage': 4,
+        'players': {'$elemMatch': {
+            'alive': True,
+            'role': {'$in': ['don', 'mafia']},
+            'id': call.from_user.id
+        }},
+        'chat': call.message.chat.id
+    })
+
+    if player_game and call.from_user.id not in player_game['played']:
+        victim = int(call.data.split()[1]) - 1
+        database.games.update_one(
+            {'_id': player_game['_id']},
+            {
+                '$addToSet': {'played': call.from_user.id},
+                '$push': {'shots': victim}
+            }
+        )
+
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text=f'Выстрел произведён в игрока {victim + 1}'
+        )
+
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь участвовать в стрельбе'
+        )
+
+
+@bot.message_handler(
+    func=lambda message: message.from_user.id == config.ADMIN_ID,
+    regexp=command_regexp('reset')
+)
+def reset(message, *args, **kwargs):
+    database.games.delete_many({})
+    bot.send_message(message.chat.id, 'База игр сброшена!')
+
+
+@bot.message_handler(
+    func=lambda message: message.from_user.id == config.ADMIN_ID,
+    regexp=command_regexp('database')
+)
+def print_database(message, *args, **kwargs):
+    print(list(database.games.find()))
+    bot.send_message(message.chat.id, 'Все документы базы данных игр выведены в терминал!')
+
+
+@bot.group_message_handler(content_types=['text'])
+def game_suggestion(message, game, *args, **kwargs):
+    if not game or message.text is None:
+        return
+    suggestion = message.text.lower().replace('ё', 'е')
+    user = user_object(message.from_user)
+    if game['game'] == 'gallows':
+        return gallows.gallows_suggestion(suggestion, game, user, message.message_id)
+    elif game['game'] == 'croco':
+        return croco.croco_suggestion(suggestion, game, user, message.message_id)
+
+@bot.group_message_handler()
+def default_handler(message, *args, **kwargs):
+    pass
