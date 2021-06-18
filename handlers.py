@@ -397,3 +397,212 @@ def check_sheriff(call):
                  if player_game['players'][check_player]['role'] == 'mafia' else
                  f'Нет, игрок под номером {check_player + 1} - не {role_titles["mafia"]}'
         )
+
+        database.games.update_one({'_id': player_game['_id']}, {'$addToSet': {'played': call.from_user.id}})
+
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь совершать проверку шерифа.'
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('append to order'))
+def append_order(call):
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        'stage': -2,
+        'players': {'$elemMatch': {
+            'role': 'don',
+            'id': call.from_user.id
+        }},
+        'chat': call.message.chat.id
+    })
+
+    if player_game:
+        call_player = re.match(r'append to order (\d+)', call.data).group(1)
+
+        database.games.update_one(
+            {'_id': player_game['_id']},
+            {'$addToSet': {'order': call_player}}
+        )
+
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text=f'Игрок под номером {call_player} добавлен в приказ.'
+        )
+
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь отдавать приказ дона.'
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('vote'))
+def vote(call):
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        'stage': 1,
+        'players': {'$elemMatch': {
+            'alive': True,
+            'id': call.from_user.id
+        }},
+        'chat': call.message.chat.id
+    })
+
+    if player_game and call.from_user.id not in player_game['played']:
+        vote_player = int(re.match(r'vote (\d+)', call.data).group(1)) - 1
+        player_index = next(i for i, p in enumerate(player_game['players']) if p['id'] == call.from_user.id)
+
+        game = database.games.find_one_and_update(
+            {'_id': player_game['_id']},
+            {'$addToSet': {
+                'played': call.from_user.id,
+                'vote.%d' % vote_player: player_index
+            }},
+            return_document=ReturnDocument.AFTER
+        )
+
+        keyboard = InlineKeyboardMarkup(row_width=8)
+        keyboard.add(
+            *[InlineKeyboardButton(
+                text=f'{i + 1}',
+                callback_data=f'vote {i + 1}'
+            ) for i, player in enumerate(game['players']) if player['alive']]
+        )
+        keyboard.add(
+            InlineKeyboardButton(
+                text='Не голосовать',
+                callback_data='vote 0'
+            )
+        )
+        bot.edit_message_text(
+            lang.vote.format(vote=get_votes(game)),
+            chat_id=game['chat'],
+            message_id=game['message_id'],
+            reply_markup=keyboard
+        )
+
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text=f'Голос отдан против игрока {vote_player + 1}.' if vote_player >= 0 else 'Голос отдан.'
+        )
+
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь голосовать.'
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'end order')
+def end_order(call):
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        'stage': -2,
+        'players': {'$elemMatch': {
+            'role': 'don',
+            'id': call.from_user.id
+        }},
+        'chat': call.message.chat.id
+    })
+
+    if player_game:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Приказ записан и будет передан команде мафии.'
+        )
+
+        go_to_next_stage(player_game)
+
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь отдавать приказ дона.'
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == 'get order',
+)
+def get_order(call):
+    player_game = database.games.find_one({
+        'game': 'mafia',
+        '$or': [
+            {'players': {'$elemMatch': {
+                'role': 'don',
+                'id': call.from_user.id
+            }}},
+            {'players': {'$elemMatch': {
+                'role': 'mafia',
+                'id': call.from_user.id
+            }}}
+        ],
+        'chat': call.message.chat.id
+    })
+
+    if player_game:
+        if player_game.get('order'):
+            order_text = f'Я отдал тебе следующий приказ: {", ".join(player_game["order"])}. Стреляем именно в таком порядке, в противном случае промахнёмся. ~ {role_titles["don"]}'
+        else:
+            order_text = f'Я не отдал приказа, импровизируем по ходу игры. Главное - стрелять в одних и тех же людей в одну ночь, в противном случае промахнёмся. ~ {role_titles["don"]}'
+
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=True,
+            text=order_text
+        )
+
+    else:
+        bot.answer_callback_query(
+            callback_query_id=call.id,
+            show_alert=False,
+            text='Ты не можешь получать приказ дона.'
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'request interact')
+def request_interact(call):
+    message_id = call.message.message_id
+    required_request = database.requests.find_one({'message_id': message_id})
+
+    if required_request:
+        update_dict = {}
+        player_object = None
+        for player in required_request['players']:
+            if player['id'] == call.from_user.id:
+                player_object = player
+                increment_value = -1
+                request_action = '$pull'
+                alert_message = 'Ты больше не в игре.'
+
+                break
+
+        if player_object is None:
+            if len(required_request['players']) >= config.PLAYERS_COUNT_LIMIT:
+                bot.answer_callback_query(
+                    callback_query_id=call.id,
+                    show_alert=False,
+                    text='В игре состоит максимальное количество игроков.'
+                )
+                return
+
+            player_object = user_object(call.from_user)
+            player_object['alive'] = True
+            increment_value = 1
+            request_action = '$push'
+            alert_message = 'Ты теперь в игре.'
+            update_dict['$set'] = {'time': time() + config.REQUEST_OVERDUE_TIME}
+
+        update_dict.update(
+            {request_action: {'players': player_object},
+             '$inc': {'players_count': increment_value}}
+        )
